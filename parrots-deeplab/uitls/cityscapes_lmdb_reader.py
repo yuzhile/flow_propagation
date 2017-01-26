@@ -5,8 +5,9 @@ from PIL import Image
 import cv2
 import sys
 from multiprocessing import Process, Queue
+import lmdb
 
-class CityscapesReader:
+class CityscapesLmdbReader:
     '''
     Load (input image, label image) pairs from PASCAL VOC
     one-at-a-time while reshaping the net to preserve dimensions
@@ -39,9 +40,11 @@ class CityscapesReader:
         self.train = cfg.get('train',False)
         self.indices = self._prepare_input(open('{}/{}.txt'.format(self.data_dir,self.split),'r').read().splitlines(),self.split)
         self.idx = 0
-        sys.path.insert(0,'{}/scripts/helpers/'.format(self.data_dir))
-        labels = __import__('labels')
-        self.id2trainId = {label.id: label.trainId for label in labels.labels}
+        self.w = 2048
+        self.h = 1024
+        self.c = 4
+        env = lmdb.open('{}/trainval_lmdb'.format(self.data_dir),readonly=True)
+        self.txn = env.begin()
         self.iter = self._read_iter()
         #self.iter = self._queue_read_iter()
         # use train flag to indicate the forward phase
@@ -136,8 +139,12 @@ class CityscapesReader:
                 idxs = self.indices[i]
 #                print 'handling {}:{}'.format(i,idxs)
 
-                image = self._load_image(idxs[0],idxs[1],idxs[2])
-                label = self._load_label(idxs[0],idxs[1],idxs[2])
+                raw_data = np.fromstring(self.txn.get(idxs[0]),dtype='uint8')
+                ndata = raw_data.reshape(self.h,self.w,self.c)
+                image = ndata[:,:,:3]
+                image = np.array(image,dtype=np.float32)
+                label = ndata[:,:,-1]
+                label = np.squeeze(label)
                 #apply mirror transformer
                 if self.mirror and np.random.randint(2):
                     image = cv2.flip(image,1)
@@ -313,4 +320,4 @@ if 'TEST_CITYSCAPES' in globals():
     pass
 else:
     from pyparrots.dnn import reader
-    reader.register_pyreader(CityscapesReader,'Cityscapes')
+    reader.register_pyreader(CityscapesLmdbReader,'CityscapesLmdb')

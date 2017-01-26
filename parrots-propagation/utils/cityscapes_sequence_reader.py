@@ -6,15 +6,15 @@ import cv2
 import sys
 from multiprocessing import Process, Queue
 
-class CityscapesReader:
+class CityscapesSequenceReader:
     '''
-    Load (input image, label image) pairs from PASCAL VOC
+    Load frame pairs from cityscapes sequence, which are (k frame,i frame,k label)
     one-at-a-time while reshaping the net to preserve dimensions
 
     Use this to feed data to a fully convolutional network.
     '''
     
-    support_keys = ['split','data_dir','randomize','crop_size','ignore_label','shrink_factor','num_class','train','mirror']
+    support_keys = ['split','data_dir','randomize','crop_size','ignore_label','shrink_factor','num_class','train','mirror','train_strategy']
 
     def config(self,cfg):
         '''
@@ -36,6 +36,11 @@ class CityscapesReader:
         self.ignore_label = int(cfg['ignore_label'])
         self.shrink_factor = int(cfg['shrink_factor'])
         self.num_class = int(cfg.get('num_class',20))
+        #train strategy can be: separate, fix_n,fix_f,free
+        self.train_strategy = cfg.get('train_strategy','separate')
+        self.strategy2int = {'separate':0,'fix_n':1,'fix_f':2,'free':3}
+        self.strategy_id = self.strategy2int[self.train_strategy]
+        
         self.train = cfg.get('train',False)
         self.indices = self._prepare_input(open('{}/{}.txt'.format(self.data_dir,self.split),'r').read().splitlines(),self.split)
         self.idx = 0
@@ -79,6 +84,7 @@ class CityscapesReader:
             # substract mean
             crop_img -= self.mean
 
+            
             # The data should be transposed for the data in caffe is chw,but parrots is whc
             # transpose hwc -> whc
             yield [crop_img.transpose((1,0,2)),label_shrink.transpose((1,0,2)), label_mask.transpose((1,0,2))]
@@ -136,24 +142,33 @@ class CityscapesReader:
                 idxs = self.indices[i]
 #                print 'handling {}:{}'.format(i,idxs)
 
-                image = self._load_image(idxs[0],idxs[1],idxs[2])
+                current_image, key_image = self._load_image(idxs[0],idxs[1],idxs[2])
                 label = self._load_label(idxs[0],idxs[1],idxs[2])
                 #apply mirror transformer
                 if self.mirror and np.random.randint(2):
-                    image = cv2.flip(image,1)
+                    current_image = cv2.flip(current_image,1)
+                    key_image = cv2.flip(key_image,1)
                     label = cv2.flip(label,1)
 
-                h, w, c = image.shape
 
-                crop_img, crop_label = self._deeplab_crop(image,label) 
+                current_crop_img, key_crop_img,crop_label = self._deeplab_crop(current_image,key_image, label) 
                 # get label mask
                 label_shrink,label_mask = self._transform_label(crop_label)
                 # substract mean
-                crop_img -= self.mean
+                current_crop_img -= self.mean
+                key_crop_img -= self.mean
+
+                strategy_id_ = np.zeros((1,1,1),dtype=np.uint8)
+                strategy_id_[0][0][0] = self.strategy_id
+
 
                 # The data should be transposed for the data in caffe is chw,but parrots is whc
                 # transpose hwc -> whc
-                yield [crop_img.transpose((1,0,2)),label_shrink.transpose((1,0,2)), label_mask.transpose((1,0,2))]
+#                print current_crop_img.shape,key_crop_img.shape,label_shrink.shape,label_mask.shape
+                #print label_shrink.shape,label_mask.shape
+                #print 'iligal label ',np.sum(np.sum(np.sum(label_shrink > 20))),np.sum(np.sum(np.sum(sum(label_shrink < 0))))
+                #print np.sum(np.sum(label_mask==1))
+                yield [current_crop_img.transpose((1,0,2)),key_crop_img.transpose((1,0,2)),label_shrink.transpose((1,0,2)), label_mask.transpose((1,0,2)),strategy_id_]
 
                 #yield [image,label,src_img]
     def _prepare_input(self, indices, split):
@@ -183,7 +198,7 @@ class CityscapesReader:
         else:
             raise Exception("Unsupported crop")
         return crop
-    def _deeplab_crop(self,seg_image,seg_label):
+    def _deeplab_crop(self,current_image,key_image,seg_label):
         '''
         apply the deeplab crop methods: fisrt padding the seg_image using mean values and padding 
         the seg_label using ignore_label if necerary.Then random crop when trainning and middle crop when val
@@ -194,9 +209,9 @@ class CityscapesReader:
         seg_image: with shape(crop_size,crop_size,c)
         seg_label: with shape(crop_size,crop_size)
         '''
-        assert len(seg_image.shape) == 3,'the image should be BGR channels'
+        assert len(current_image.shape) == 3,'the image should be BGR channels'
         assert len(seg_label.shape) == 2,'the image seg label should be 2 dim'
-        data_height,data_width,data_c =  seg_image.shape
+        data_height,data_width,data_c =  current_image.shape
         label_height,label_width = seg_label.shape
         assert data_height == label_height,'image and label should have the same height'
         assert data_width == label_width,'image and label should have the same width'
@@ -210,7 +225,7 @@ class CityscapesReader:
         if pad_height > 0 or pad_width > 0:
             #cv2 copymakevorder need float64 as value parameter
             mean = np.array(self.mean,dtype=np.float64)
-            seg_image = cv2.copyMakeBorder(seg_image,0,pad_height,0,pad_width,cv2.BORDER_CONSTANT,value=mean)
+            seg_image = cv2.copyMakeBorder(current_image,0,pad_height,0,pad_width,cv2.BORDER_CONSTANT,value=mean)
             seg_label = cv2.copyMakeBorder(seg_label,0,pad_height,0,pad_width,cv2.BORDER_CONSTANT,value=self.ignore_label)
 
             # update height/width
@@ -228,7 +243,7 @@ class CityscapesReader:
             w_off = (data_width - crop_size) / 2
 
         # roi image
-        return seg_image[h_off:h_off+crop_size, w_off:w_off+crop_size,:],seg_label[h_off:h_off+crop_size,w_off:w_off+crop_size]
+        return current_image[h_off:h_off+crop_size, w_off:w_off+crop_size,:],key_image[h_off:h_off+crop_size, w_off:w_off+crop_size,:],seg_label[h_off:h_off+crop_size,w_off:w_off+crop_size]
 
 
     def _transform_label(self,raw_label):
@@ -262,17 +277,34 @@ class CityscapesReader:
         '''
         
         #im = Image.open('{}{}'.format(self.voc_dir, idx))
-        full_name = '{}/leftImg8bit/{}/{}_leftImg8bit.png'.format(self.data_dir,split,idx)
-        im = cv2.imread(full_name)
-        im = self.half_crop_image(im,position,label=False)
-        in_ = np.array(im,dtype=np.float32)
-        # RGB->BGR
-        #in_ = im[:,:,::-1]
-        # sub mean
-        #in_ -= self.mean
+        key_full_name = '{}/leftImg8bit/{}/{}_leftImg8bit.png'.format(self.data_dir,split,idx)
+
+        city, shot, frame = idx.split('_')
+        if self.train_strategy == 'separate':
+            SEQ_LEN = -4
+        elif self.train_strategy == 'fix_n':
+            SEQ_LEN = - np.random.randint(1,10)
+        elif self.train_strategy == 'fix_f':
+            SEQ_LEN = - np.random.randint(1,10)
+        elif self.train_strategy == 'free':
+            SEQ_LEN = np.random.randint(-9,10)
+            if SEQ_LEN >=0:
+                self.strategy_id = self.strategy2int['fix_f']
+        key_im = cv2.imread(key_full_name)
+        key_im = self.half_crop_image(key_im,position,label=False)
+        key_in_ = np.array(key_im,dtype=np.float32)
+        #handing the crash image, we find the no-error image with decreasing the idx
+        for i in range(10):
+            current_full_name = '{}/leftImg8bit_sequence/{}/{}_{}_{:0>6d}_leftImg8bit.png'.format(self.data_dir,split,city,shot,int(frame) + SEQ_LEN-i)
+            current_im = cv2.imread(current_full_name)
+            if current_im is None:
+                continue
+            current_im = self.half_crop_image(current_im,position,label=False)
+            current_in_ = np.array(current_im,dtype=np.float32)
+            break
 
         
-        return in_
+        return current_in_,key_in_
            
     def assign_trainIds(self,label):
         '''
@@ -313,4 +345,4 @@ if 'TEST_CITYSCAPES' in globals():
     pass
 else:
     from pyparrots.dnn import reader
-    reader.register_pyreader(CityscapesReader,'Cityscapes')
+    reader.register_pyreader(CityscapesSequenceReader,'CityscapesSequence')
